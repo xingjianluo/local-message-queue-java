@@ -2,9 +2,11 @@ package com.github.xingjianluo.localmessagequeuejava.web;
 
 import com.github.xingjianluo.localmessagequeuejava.broker.CommitResult;
 import com.github.xingjianluo.localmessagequeuejava.broker.DeadLetter;
+import com.github.xingjianluo.localmessagequeuejava.broker.DeadLetterStats;
 import com.github.xingjianluo.localmessagequeuejava.broker.LocalMessageBroker;
 import com.github.xingjianluo.localmessagequeuejava.broker.Message;
 import com.github.xingjianluo.localmessagequeuejava.broker.PublishResult;
+import com.github.xingjianluo.localmessagequeuejava.broker.ReplayResult;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -82,6 +84,28 @@ public class QueueController {
         return broker.deadLetter(messageId).map(ResponseEntity::ok).orElse(ResponseEntity.notFound().build());
     }
 
+    @PostMapping("/dead-letters/replay")
+    public ReplayResult replayDeadLetter(@RequestBody DeadLetterRequest req) {
+        return broker.replayDeadLetter(req.topic(), req.messageId());
+    }
+
+    @PostMapping("/dead-letters/purge")
+    public Map<String, Object> purgeDeadLetter(@RequestBody DeadLetterRequest req) {
+        boolean purged = broker.purgeDeadLetter(req.topic(), req.messageId());
+        return Map.of("topic", req.topic(), "messageId", req.messageId(), "purged", purged);
+    }
+
+    @PostMapping("/dead-letters/retention")
+    public DeadLetterStats setDeadLetterRetention(@RequestBody RetentionRequest req) {
+        broker.setDeadLetterRetention(req.topic(), req.maxRetained());
+        return broker.deadLetterStats(req.topic());
+    }
+
+    @GetMapping("/dead-letters/stats")
+    public DeadLetterStats deadLetterStats(@RequestParam String topic) {
+        return broker.deadLetterStats(topic);
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleIllegalArgument(IllegalArgumentException e) {
         return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
@@ -97,5 +121,11 @@ public class QueueController {
     }
 
     public record OffsetRequest(String group, String topic, int partition, long offset) {
+    }
+
+    public record DeadLetterRequest(String topic, String messageId) {
+    }
+
+    public record RetentionRequest(String topic, Integer maxRetained) {
     }
 }

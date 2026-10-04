@@ -23,9 +23,13 @@ import java.util.concurrent.ConcurrentMap;
  *   <li>非空去重键在「主题+分区」维度幂等：并发发布只有首次生效。</li>
  *   <li>nack 触发线性退避（backoffMillis * 已投递次数），投递次数达到 maxAttempts 进入死信队列；
  *       死信位点视为已解决，不阻塞同分区后续位点推进。</li>
+ *   <li>死信可重放：重新投回原分区日志末尾、按现有投递与重试规则再走一遍，不回退已确认位点；
+ *       同一消息 ID 在死信队列中最多一条。死信支持按主题设置保留上限（超出按进入先后淘汰最旧）
+ *       与主动清理；当前条数 / 累计条数 / 列表 / 单查同一口径。</li>
  * </ul>
  *
- * <p>并发边界：所有状态变更均在「分区锁」下进行，同一分区串行化，不同分区互不阻塞。</p>
+ * <p>并发边界：所有状态变更均在「分区锁」下进行，同一分区串行化，不同分区互不阻塞；
+ * 死信存储按主题独立加锁（锁顺序：分区锁 → 死信存储锁），多分区并发产生死信不会互相污染视图。</p>
  */
 public class LocalMessageBroker {
 
@@ -44,10 +48,8 @@ public class LocalMessageBroker {
     private final ConcurrentMap<TopicPartition, ConcurrentMap<String, Long>> dedupIndexes = new ConcurrentHashMap<>();
     /** group -> TopicPartition -> 消费组分区状态 */
     private final ConcurrentMap<String, ConcurrentMap<TopicPartition, GroupPartitionState>> groupStates = new ConcurrentHashMap<>();
-    /** topic -> 死信列表 */
-    private final ConcurrentMap<String, List<DeadLetter>> deadLettersByTopic = new ConcurrentHashMap<>();
-    /** messageId -> 死信 */
-    private final ConcurrentMap<String, DeadLetter> deadLettersById = new ConcurrentHashMap<>();
+    /** topic -> 死信存储（列表/索引/统计/保留策略的一致性边界） */
+    private final ConcurrentMap<String, DeadLetterStore> deadLetterStores = new ConcurrentHashMap<>();
 
     private final int maxAttempts;
     private final long backoffMillis;
@@ -208,8 +210,7 @@ public class LocalMessageBroker {
                 Message dead = withAttempts(original, attempts);
                 DeadLetter dl = new DeadLetter(dead,
                         "重试耗尽：已投递 " + attempts + " 次，达到上限 " + maxAttempts, clock.millis());
-                deadLettersByTopic.computeIfAbsent(topic, k -> new ArrayList<>()).add(dl);
-                deadLettersById.put(dead.id(), dl);
+                deadLetterStore(topic).add(dl);
                 advanceCommitted(st);
                 return dead;
             }
@@ -245,15 +246,85 @@ public class LocalMessageBroker {
         }
     }
 
-    /** 查询某主题的死信队列（快照） */
+    /** 查询某主题的死信队列（快照，按进入死信先后排序） */
     public List<DeadLetter> deadLetters(String topic) {
         requireTopic(topic);
-        return List.copyOf(deadLettersByTopic.getOrDefault(topic, List.of()));
+        return deadLetterStore(topic).list();
     }
 
-    /** 按消息 ID 查询死信 */
+    /** 按消息 ID 查询死信（跨主题检索当前仍在死信队列中的条目） */
     public Optional<DeadLetter> deadLetter(String messageId) {
-        return Optional.ofNullable(deadLettersById.get(messageId));
+        for (DeadLetterStore store : deadLetterStores.values()) {
+            Optional<DeadLetter> hit = store.get(messageId);
+            if (hit.isPresent()) {
+                return hit;
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * 重放死信：把指定主题下仍在死信队列中的消息重新投回其原分区日志末尾，
+     * 按现有投递与重试规则再走一遍（attempts 重新计数）。
+     *
+     * <p>重放不会回退任何已确认位点，也不阻塞同分区其它消息；原死信条目随即移除。
+     * 若该消息之后再次重试耗尽，会作为同一条死信（同一消息 ID）重新进入死信队列，
+     * 队列中同一时刻最多只有它的一条死信条目。</p>
+     *
+     * @return 成功 / 失败及可区分原因（未知消息、主题不符、已清理、已重放）
+     */
+    public ReplayResult replayDeadLetter(String topic, String messageId) {
+        requireTopic(topic);
+        DeadLetterStore store = deadLetterStore(topic);
+        Optional<DeadLetter> candidate = store.get(messageId);
+        if (candidate.isEmpty()) {
+            return ReplayResult.reject(replayRejectionReason(topic, messageId));
+        }
+        TopicPartition tp = new TopicPartition(topic, candidate.get().message().partition());
+        synchronized (lock(tp)) {
+            DeadLetter removed = store.removeForReplay(messageId);
+            if (removed == null) {
+                // 与并发重放/清理竞争失败，重新判定原因
+                return ReplayResult.reject(replayRejectionReason(topic, messageId));
+            }
+            List<Message> log = logs.computeIfAbsent(tp, k -> new ArrayList<>());
+            Message m = removed.message();
+            Message replayed = new Message(m.id(), topic, m.partition(), log.size(),
+                    m.key(), m.dedupKey(), m.payload(), 0);
+            log.add(replayed);
+            return ReplayResult.ok(replayed);
+        }
+    }
+
+    /**
+     * 主动清理已处理的死信：清理后列表与按 ID 查询均不再返回它，
+     * 但不影响其余死信与累计计数；已被清理的消息再重放会被拒绝（ALREADY_PURGED）。
+     *
+     * @return 是否确实清掉了一条仍在队列中的死信
+     */
+    public boolean purgeDeadLetter(String topic, String messageId) {
+        requireTopic(topic);
+        return deadLetterStore(topic).purge(messageId);
+    }
+
+    /**
+     * 设置主题死信保留上限：超出后按进入死信先后淘汰最旧条目（淘汰视同清理）。
+     * 不影响正常分区的位点推进与在途消费；累计计数不受影响。
+     *
+     * @param maxRetained 最多保留条数（>= 1）；传 null 取消限制
+     */
+    public void setDeadLetterRetention(String topic, Integer maxRetained) {
+        requireTopic(topic);
+        if (maxRetained != null && maxRetained < 1) {
+            throw new IllegalArgumentException("死信保留上限必须 >= 1，或传 null 取消限制");
+        }
+        deadLetterStore(topic).setMaxRetained(maxRetained);
+    }
+
+    /** 主题死信统计：当前条数 / 累计进入条数 / 保留上限，与列表查询同一口径 */
+    public DeadLetterStats deadLetterStats(String topic) {
+        requireTopic(topic);
+        return deadLetterStore(topic).stats(topic);
     }
 
     // ------------------------------------------------------------------
@@ -304,6 +375,36 @@ public class LocalMessageBroker {
         }
     }
 
+    private DeadLetterStore deadLetterStore(String topic) {
+        return deadLetterStores.computeIfAbsent(topic, t -> new DeadLetterStore());
+    }
+
+    /** 重放拒绝原因判定：先查本主题处置记录，再查其它主题的现存死信与处置记录 */
+    private ReplayRejectionReason replayRejectionReason(String topic, String messageId) {
+        DeadLetterDisposition own = deadLetterStore(topic).disposition(messageId);
+        if (own != null) {
+            return own.rejectionReason;
+        }
+        for (Map.Entry<String, DeadLetterStore> e : deadLetterStores.entrySet()) {
+            if (e.getKey().equals(topic)) {
+                continue;
+            }
+            if (e.getValue().get(messageId).isPresent()) {
+                return ReplayRejectionReason.TOPIC_MISMATCH;
+            }
+        }
+        for (Map.Entry<String, DeadLetterStore> e : deadLetterStores.entrySet()) {
+            if (e.getKey().equals(topic)) {
+                continue;
+            }
+            DeadLetterDisposition other = e.getValue().disposition(messageId);
+            if (other != null) {
+                return other.rejectionReason;
+            }
+        }
+        return ReplayRejectionReason.UNKNOWN_MESSAGE;
+    }
+
     /** 主题分区 */
     private record TopicPartition(String topic, int partition) {
     }
@@ -327,6 +428,97 @@ public class LocalMessageBroker {
         private InFlight(int attempts, long deliverAt) {
             this.attempts = attempts;
             this.deliverAt = deliverAt;
+        }
+    }
+
+    /** 死信离开队列后的处置方式（用于给出可区分的重放拒绝原因） */
+    private enum DeadLetterDisposition {
+        REPLAYED(ReplayRejectionReason.ALREADY_REPLAYED),
+        PURGED(ReplayRejectionReason.ALREADY_PURGED);
+
+        private final ReplayRejectionReason rejectionReason;
+
+        DeadLetterDisposition(ReplayRejectionReason rejectionReason) {
+            this.rejectionReason = rejectionReason;
+        }
+    }
+
+    /**
+     * 单个主题的死信存储：列表、按 ID 索引、当前条数、累计条数与保留策略的一致性边界。
+     * 所有方法内部同步；插入顺序即「进入死信先后」，保留上限超限时按此顺序淘汰最旧条目。
+     * 同一消息 ID 在队列中最多一条；离开队列（重放/清理/淘汰）时记录处置方式。
+     */
+    private static final class DeadLetterStore {
+        /** messageId -> 死信，LinkedHashMap 保持进入顺序（淘汰依据） */
+        private final Map<String, DeadLetter> entries = new java.util.LinkedHashMap<>();
+        /** messageId -> 离开队列后的处置方式（墓碑，用于重放拒绝原因判定） */
+        private final Map<String, DeadLetterDisposition> dispositions = new java.util.HashMap<>();
+        private long cumulativeCount;
+        private Integer maxRetained;
+
+        /** 幂等写入：同一消息 ID 已在队列中则不重复入列；写入后按保留上限淘汰最旧 */
+        synchronized void add(DeadLetter dl) {
+            String id = dl.message().id();
+            if (!entries.containsKey(id)) {
+                entries.put(id, dl);
+                cumulativeCount++;
+            } else {
+                entries.put(id, dl);
+            }
+            dispositions.remove(id);
+            evictOverflow();
+        }
+
+        synchronized List<DeadLetter> list() {
+            return List.copyOf(entries.values());
+        }
+
+        synchronized Optional<DeadLetter> get(String messageId) {
+            return Optional.ofNullable(entries.get(messageId));
+        }
+
+        synchronized DeadLetterDisposition disposition(String messageId) {
+            return dispositions.get(messageId);
+        }
+
+        /** 重放摘除：原子移除并记录 REPLAYED 处置；不存在返回 null */
+        synchronized DeadLetter removeForReplay(String messageId) {
+            DeadLetter removed = entries.remove(messageId);
+            if (removed != null) {
+                dispositions.put(messageId, DeadLetterDisposition.REPLAYED);
+            }
+            return removed;
+        }
+
+        /** 主动清理：移除并记录 PURGED 处置；返回是否确实移除了一条 */
+        synchronized boolean purge(String messageId) {
+            DeadLetter removed = entries.remove(messageId);
+            if (removed == null) {
+                return false;
+            }
+            dispositions.put(messageId, DeadLetterDisposition.PURGED);
+            return true;
+        }
+
+        /** 设置保留上限；调低时立即按进入先后淘汰最旧条目（淘汰视同清理） */
+        synchronized void setMaxRetained(Integer maxRetained) {
+            this.maxRetained = maxRetained;
+            evictOverflow();
+        }
+
+        synchronized DeadLetterStats stats(String topic) {
+            return new DeadLetterStats(topic, entries.size(), cumulativeCount, maxRetained);
+        }
+
+        private void evictOverflow() {
+            if (maxRetained == null) {
+                return;
+            }
+            while (entries.size() > maxRetained) {
+                String eldest = entries.keySet().iterator().next();
+                entries.remove(eldest);
+                dispositions.put(eldest, DeadLetterDisposition.PURGED);
+            }
         }
     }
 }
