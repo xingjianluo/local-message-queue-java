@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentMap;
  *   <li>nack 触发线性退避（backoffMillis * 已投递次数），投递次数达到 maxAttempts 进入死信队列；
  *       死信位点视为已解决，不阻塞同分区后续位点推进。</li>
  *   <li>死信可重放：重新投回原分区日志末尾、按现有投递与重试规则再走一遍，不回退已确认位点；
+ *       重放会把非空去重键的索引归属迁移到新位点，同分区同去重键始终只有一条有效消息；
  *       同一消息 ID 在死信队列中最多一条。死信支持按主题设置保留上限（超出按进入先后淘汰最旧）
  *       与主动清理；当前条数 / 累计条数 / 列表 / 单查同一口径。</li>
  * </ul>
@@ -44,7 +45,7 @@ public class LocalMessageBroker {
     private final ConcurrentMap<TopicPartition, Object> locks = new ConcurrentHashMap<>();
     /** TopicPartition -> 仅追加的消息日志（offset 即下标） */
     private final ConcurrentMap<TopicPartition, List<Message>> logs = new ConcurrentHashMap<>();
-    /** TopicPartition -> dedupKey -> 首次消息位点 */
+    /** TopicPartition -> dedupKey -> 该键当前有效（可投递）消息位点；死信重放时迁移到新位点 */
     private final ConcurrentMap<TopicPartition, ConcurrentMap<String, Long>> dedupIndexes = new ConcurrentHashMap<>();
     /** group -> TopicPartition -> 消费组分区状态 */
     private final ConcurrentMap<String, ConcurrentMap<TopicPartition, GroupPartitionState>> groupStates = new ConcurrentHashMap<>();
@@ -271,6 +272,11 @@ public class LocalMessageBroker {
      * 若该消息之后再次重试耗尽，会作为同一条死信（同一消息 ID）重新进入死信队列，
      * 队列中同一时刻最多只有它的一条死信条目。</p>
      *
+     * <p>去重键归属随重放迁移：携带非空去重键的消息被重放后，该分区的去重索引从
+     * 「已死信的旧位点」改指「重放后的新位点」——同一分区内同一去重键仍只对应一条有效消息，
+     * 重放出来的消息可被正常消费；此后再用同一去重键发布，按现有幂等语义返回该重放消息
+     * （DEDUPLICATED），不会指回旧死信消息。</p>
+     *
      * @return 成功 / 失败及可区分原因（未知消息、主题不符、已清理、已重放）
      */
     public ReplayResult replayDeadLetter(String topic, String messageId) {
@@ -289,9 +295,16 @@ public class LocalMessageBroker {
             }
             List<Message> log = logs.computeIfAbsent(tp, k -> new ArrayList<>());
             Message m = removed.message();
-            Message replayed = new Message(m.id(), topic, m.partition(), log.size(),
+            long newOffset = log.size();
+            Message replayed = new Message(m.id(), topic, m.partition(), newOffset,
                     m.key(), m.dedupKey(), m.payload(), 0);
             log.add(replayed);
+            if (m.dedupKey() != null) {
+                // 重放是管理动作：把去重键的归属位点从「已死信的旧位点」迁移到「重放后的新位点」，
+                // 保证同一分区内同一去重键始终只对应一条有效（可投递）消息；旧位点已随死信解决、
+                // 永不再投递。否则重放后会出现两条同键消息，且后续按键发布会命中旧死信消息。
+                dedupIndexes.computeIfAbsent(tp, k -> new ConcurrentHashMap<>()).put(m.dedupKey(), newOffset);
+            }
             return ReplayResult.ok(replayed);
         }
     }

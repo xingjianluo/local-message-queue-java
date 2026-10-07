@@ -1,9 +1,12 @@
 package com.github.xingjianluo.localmessagequeuejava.tests;
 
+import com.github.xingjianluo.localmessagequeuejava.broker.CommitResult;
 import com.github.xingjianluo.localmessagequeuejava.broker.DeadLetter;
 import com.github.xingjianluo.localmessagequeuejava.broker.DeadLetterStats;
 import com.github.xingjianluo.localmessagequeuejava.broker.LocalMessageBroker;
 import com.github.xingjianluo.localmessagequeuejava.broker.Message;
+import com.github.xingjianluo.localmessagequeuejava.broker.PublishOutcome;
+import com.github.xingjianluo.localmessagequeuejava.broker.PublishResult;
 import com.github.xingjianluo.localmessagequeuejava.broker.ReplayRejectionReason;
 import com.github.xingjianluo.localmessagequeuejava.broker.ReplayResult;
 import org.junit.jupiter.api.Test;
@@ -137,6 +140,125 @@ public class DeadLetterManagementTests {
         // 这次可以再次重放（当前确实在死信队列中）
         assertTrue(broker.replayDeadLetter("flaky", poison.id()).success());
         log.info("再次重放 key=k-flaky id={} 判定=允许（当前在死信队列中）", poison.id());
+    }
+
+    @Test
+    void replayMigratesDedupKeySoReplayedMessageIsConsumableAndRepublishIsDeterministic() {
+        LocalMessageBroker broker = new LocalMessageBroker(3, 0L, Clock.systemUTC());
+        broker.createTopic("orders-idem", 1);
+        broker.subscribe("g-idem", "orders-idem");
+        // 模拟下游幂等表：只有「成功确认」过的去重键才记录；进死信不等于成功处理
+        Set<String> downstreamProcessedDedupKeys = new HashSet<>();
+
+        String dedupKey = "order-777";
+        PublishResult first = broker.publish("orders-idem", 0, "k-order", dedupKey, "100 元");
+        assertEquals(PublishOutcome.ACCEPTED, first.outcome());
+        assertEquals(0L, first.message().offset());
+        PublishResult duplicate = broker.publish("orders-idem", 0, "k-order-copy", dedupKey, "100 元");
+        assertEquals(PublishOutcome.DEDUPLICATED, duplicate.outcome());
+        assertEquals(first.message().id(), duplicate.message().id());
+        log.info("发布 key=k-order dedupKey={} offset=0 判定=首次 ACCEPTED; 重复发布 DEDUPLICATED 指回 offset=0",
+                dedupKey);
+
+        // 重试耗尽进入死信（从未成功确认，下游幂等表不会记录该键）
+        broker.poll("g-idem", "orders-idem", 0, 10);
+        Message dead = driveToDeadLetter(broker, "g-idem", "orders-idem", 0, 0, 3);
+        assertEquals(3, dead.attempts());
+        assertEquals(1L, broker.committedOffset("g-idem", "orders-idem", 0));
+        assertEquals(1, broker.deadLetters("orders-idem").size());
+        assertTrue(downstreamProcessedDedupKeys.isEmpty(),
+                "死信从未成功处理，下游按去重键的幂等表不应记录它");
+        log.info("重试耗尽 key=k-order dedupKey={} id={} offset=0 判定=进入死信, committed=1, 下游幂等表不含该键",
+                dedupKey, dead.id());
+
+        // 重放：投回原分区日志末尾，位点不回退
+        ReplayResult replayed = broker.replayDeadLetter("orders-idem", dead.id());
+        assertTrue(replayed.success());
+        assertEquals(dead.id(), replayed.message().id());
+        assertEquals(1L, replayed.message().offset());
+        assertEquals(0, replayed.message().attempts());
+        assertEquals(1L, broker.committedOffset("g-idem", "orders-idem", 0));
+        log.info("重放 key=k-order dedupKey={} id={} 新offset=1 判定=去重索引归属由旧offset=0迁移到新offset=1, committed 保持 1",
+                dedupKey, dead.id());
+
+        // 下游按去重键做幂等消费：同分区内该键当前只有重放出来的这一条有效（可投递）消息，
+        // 且该键从未被成功处理过 → 不得被当成重复丢弃，必须能正常消费并确认
+        List<Message> batch = broker.poll("g-idem", "orders-idem", 0, 10);
+        List<Message> sameKey = batch.stream().filter(m -> dedupKey.equals(m.dedupKey())).toList();
+        assertEquals(1, sameKey.size(), "重放后同一分区同一去重键只能拉到一条有效消息");
+        Message replayedDelivery = sameKey.get(0);
+        assertEquals(1L, replayedDelivery.offset());
+        assertFalse(downstreamProcessedDedupKeys.contains(replayedDelivery.dedupKey()),
+                "重放消息携带的去重键尚未成功处理过，下游不得把它判重丢弃");
+        CommitResult ack = broker.commit("g-idem", "orders-idem", 0, replayedDelivery.offset());
+        assertTrue(ack.success());
+        downstreamProcessedDedupKeys.add(replayedDelivery.dedupKey());
+        assertEquals(2L, broker.committedOffset("g-idem", "orders-idem", 0));
+        assertTrue(broker.poll("g-idem", "orders-idem", 0, 10).isEmpty());
+        log.info("再消费 key=k-order dedupKey={} offset=1 判定=未被下游判重, 正常确认 committed=2, 同键有效消息仅此一条",
+                dedupKey);
+
+        // 重放后再用同一去重键发布：仍按现有幂等语义 DEDUPLICATED，
+        // 但必须指回「重放后的消息」（位点 1、原内容），不能指回旧死信消息，新内容也不得入队
+        PublishResult republish = broker.publish("orders-idem", 0, "k-order-new", dedupKey, "200 元(新内容)");
+        assertEquals(PublishOutcome.DEDUPLICATED, republish.outcome());
+        assertEquals(replayed.message().id(), republish.message().id(), "去重必须命中重放后的消息，而非旧死信消息");
+        assertEquals(1L, republish.message().offset(), "返回的位点必须是重放后的新位点");
+        assertEquals("100 元", republish.message().payload(), "返回的内容必须是重放消息的内容");
+        assertEquals(2L, broker.logEndOffset("orders-idem", 0), "被去重的新发布不得写入日志");
+        log.info("再发布 key=k-order-new dedupKey={} 判定=DEDUPLICATED 确定性指回重放消息 id={} offset=1 内容='100 元', logEnd 保持 2",
+                dedupKey, republish.message().id());
+
+        // 已重放且已解决的消息，重复重放依旧被拒绝（ALREADY_REPLAYED 语义不回退）
+        ReplayResult again = broker.replayDeadLetter("orders-idem", dead.id());
+        assertFalse(again.success());
+        assertEquals(ReplayRejectionReason.ALREADY_REPLAYED, again.reason());
+        log.info("重复重放 key=k-order id={} 判定=拒绝 ALREADY_REPLAYED（当前不在死信队列）", dead.id());
+    }
+
+    @Test
+    void replayFailingAgainThenRepublishPointsAtLatestReplayedOffset() {
+        LocalMessageBroker broker = new LocalMessageBroker(2, 0L, Clock.systemUTC());
+        broker.createTopic("idem-flaky", 1);
+        broker.subscribe("g-if", "idem-flaky");
+        String dedupKey = "dedup-flaky";
+
+        Message poison = broker.publish("idem-flaky", 0, "k-flaky", dedupKey, "v1").message();
+        broker.poll("g-if", "idem-flaky", 0, 10);
+        driveToDeadLetter(broker, "g-if", "idem-flaky", 0, 0, 2);
+        log.info("首次重试耗尽 key=k-flaky dedupKey={} id={} offset=0 判定=进入死信", dedupKey, poison.id());
+
+        // 第一次重放（offset=1）后继续失败，再次进入死信：去重索引必须跟着迁移到 offset=1
+        assertTrue(broker.replayDeadLetter("idem-flaky", poison.id()).success());
+        broker.poll("g-if", "idem-flaky", 0, 10);
+        Message deadAgain = driveToDeadLetter(broker, "g-if", "idem-flaky", 0, 1, 2);
+        assertEquals(poison.id(), deadAgain.id());
+        assertEquals(1, broker.deadLetters("idem-flaky").size());
+        log.info("重放后再次耗尽 key=k-flaky dedupKey={} id={} 最新位点=1 判定=死信中仍只有一条",
+                dedupKey, poison.id());
+
+        // 此时同键发布：命中的必须是最新位点 1 的那条（当前死信），而不是最初的旧位点 0
+        PublishResult republish = broker.publish("idem-flaky", 0, "k-other", dedupKey, "v2");
+        assertEquals(PublishOutcome.DEDUPLICATED, republish.outcome());
+        assertEquals(poison.id(), republish.message().id());
+        assertEquals(1L, republish.message().offset(), "去重口径必须跟随最近一次重放迁移到最新位点");
+        assertEquals("v1", republish.message().payload());
+        assertEquals(2L, broker.logEndOffset("idem-flaky", 0));
+        log.info("再发布 dedupKey={} 判定=DEDUPLICATED 指回当前死信消息 id={} offset=1（非旧死信 offset=0）, logEnd=2",
+                dedupKey, poison.id());
+
+        // 再次重放（offset=2）后索引继续迁移，同分区同键仍只有一条可投递消息
+        ReplayResult replayed2 = broker.replayDeadLetter("idem-flaky", poison.id());
+        assertTrue(replayed2.success());
+        assertEquals(2L, replayed2.message().offset());
+        List<Message> batch = broker.poll("g-if", "idem-flaky", 0, 10);
+        List<Message> sameKey = batch.stream().filter(m -> dedupKey.equals(m.dedupKey())).toList();
+        assertEquals(1, sameKey.size());
+        assertEquals(2L, sameKey.get(0).offset());
+        assertEquals(2L, broker.committedOffset("g-if", "idem-flaky", 0),
+                "死信/重放均不回退已推进位点");
+        log.info("再次重放 dedupKey={} id={} 新offset=2 判定=可投递同键消息仍仅一条, committed 保持 2 不回退",
+                dedupKey, poison.id());
     }
 
     @Test
