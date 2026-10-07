@@ -24,7 +24,8 @@ import java.util.concurrent.ConcurrentMap;
  *   <li>nack 触发线性退避（backoffMillis * 已投递次数），投递次数达到 maxAttempts 进入死信队列；
  *       死信位点视为已解决，不阻塞同分区后续位点推进。</li>
  *   <li>死信可重放：重新投回原分区日志末尾、按现有投递与重试规则再走一遍，不回退已确认位点；
- *       同一消息 ID 在死信队列中最多一条。死信支持按主题设置保留上限（超出按进入先后淘汰最旧）
+ *       同一消息 ID 在死信队列中最多一条；若原消息带去重键，重放后该键改指重放后的新位点，
+ *       同一分区内同一去重键始终只对应一条有效消息。死信支持按主题设置保留上限（超出按进入先后淘汰最旧）
  *       与主动清理；当前条数 / 累计条数 / 列表 / 单查同一口径。</li>
  * </ul>
  *
@@ -271,6 +272,10 @@ public class LocalMessageBroker {
      * 若该消息之后再次重试耗尽，会作为同一条死信（同一消息 ID）重新进入死信队列，
      * 队列中同一时刻最多只有它的一条死信条目。</p>
      *
+     * <p>若消息携带非空去重键，重放会把该键的幂等指向改到重放后的新位点：
+     * 同一分区内同一去重键始终只对应一条有效消息（即重放出来的这条），
+     * 后续用同一去重键发布会幂等地返回重放消息，而不会指回已进过死信的旧位点。</p>
+     *
      * @return 成功 / 失败及可区分原因（未知消息、主题不符、已清理、已重放）
      */
     public ReplayResult replayDeadLetter(String topic, String messageId) {
@@ -292,6 +297,12 @@ public class LocalMessageBroker {
             Message replayed = new Message(m.id(), topic, m.partition(), log.size(),
                     m.key(), m.dedupKey(), m.payload(), 0);
             log.add(replayed);
+            if (replayed.dedupKey() != null) {
+                // 去重索引改指重放后的新位点：同一分区内同一去重键只对应这条有效的重放消息，
+                // 不再指回已进过死信的旧位点，后续同键发布幂等到重放消息上
+                dedupIndexes.computeIfAbsent(tp, k -> new ConcurrentHashMap<>())
+                        .put(replayed.dedupKey(), replayed.offset());
+            }
             return ReplayResult.ok(replayed);
         }
     }

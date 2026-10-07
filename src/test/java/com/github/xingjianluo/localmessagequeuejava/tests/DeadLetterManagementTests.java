@@ -4,6 +4,8 @@ import com.github.xingjianluo.localmessagequeuejava.broker.DeadLetter;
 import com.github.xingjianluo.localmessagequeuejava.broker.DeadLetterStats;
 import com.github.xingjianluo.localmessagequeuejava.broker.LocalMessageBroker;
 import com.github.xingjianluo.localmessagequeuejava.broker.Message;
+import com.github.xingjianluo.localmessagequeuejava.broker.PublishOutcome;
+import com.github.xingjianluo.localmessagequeuejava.broker.PublishResult;
 import com.github.xingjianluo.localmessagequeuejava.broker.ReplayRejectionReason;
 import com.github.xingjianluo.localmessagequeuejava.broker.ReplayResult;
 import org.junit.jupiter.api.Test;
@@ -137,6 +139,64 @@ public class DeadLetterManagementTests {
         // 这次可以再次重放（当前确实在死信队列中）
         assertTrue(broker.replayDeadLetter("flaky", poison.id()).success());
         log.info("再次重放 key=k-flaky id={} 判定=允许（当前在死信队列中）", poison.id());
+    }
+
+    @Test
+    void replayWithDedupKeyKeepsDedupIndexConsistent() {
+        LocalMessageBroker broker = new LocalMessageBroker(2, 0L, Clock.systemUTC());
+        broker.createTopic("orders-dedup", 1);
+        broker.subscribe("g-dedup", "orders-dedup");
+
+        // 带去重键发布：首次 ACCEPTED，重复发布幂等到同一条
+        Message first = broker.publish("orders-dedup", 0, "k-dedup", "d-1", "v1").message();
+        assertEquals(0L, first.offset());
+        PublishResult dup = broker.publish("orders-dedup", 0, "k-dedup-copy", "d-1", "v1");
+        assertEquals(PublishOutcome.DEDUPLICATED, dup.outcome());
+        assertEquals(0L, dup.message().offset());
+        log.info("去重键=d-1 重复发布 判定=幂等到 key=k-dedup offset=0, logEnd=1");
+
+        // 重试耗尽进死信
+        broker.poll("g-dedup", "orders-dedup", 0, 10);
+        Message dead = driveToDeadLetter(broker, "g-dedup", "orders-dedup", 0, 0, 2);
+        assertEquals(2, dead.attempts());
+        assertEquals(1, broker.deadLetters("orders-dedup").size());
+        assertEquals(1L, broker.committedOffset("g-dedup", "orders-dedup", 0));
+        log.info("重试耗尽 key=k-dedup 去重键=d-1 offset=0 判定=进入死信, committed=1 已推进");
+
+        // 重放：投回原分区日志末尾，去重键改指新位点
+        ReplayResult replayed = broker.replayDeadLetter("orders-dedup", first.id());
+        assertTrue(replayed.success());
+        assertEquals(first.id(), replayed.message().id());
+        assertEquals("d-1", replayed.message().dedupKey());
+        assertEquals(1L, replayed.message().offset());
+        assertEquals(2L, broker.logEndOffset("orders-dedup", 0));
+        assertEquals(1L, broker.committedOffset("g-dedup", "orders-dedup", 0));
+        log.info("重放 key=k-dedup 去重键=d-1 id={} 新offset=1 判定=去重索引改指新位点, committed 保持 1 不回退",
+                first.id());
+
+        // 再消费：重放消息能被正常拉到并确认
+        List<Message> batch = broker.poll("g-dedup", "orders-dedup", 0, 10);
+        assertEquals(1, batch.size());
+        assertEquals(1L, batch.get(0).offset());
+        assertEquals(first.id(), batch.get(0).id());
+        assertEquals(1, batch.get(0).attempts());
+        broker.commit("g-dedup", "orders-dedup", 0, 1);
+        assertEquals(2L, broker.committedOffset("g-dedup", "orders-dedup", 0));
+        log.info("再消费 key=k-dedup 去重键=d-1 offset=1 判定=重放消息正常投递并确认, committed=2");
+
+        // 再发布：同一去重键幂等到重放后的这条有效消息，不得指回已进过死信的旧位点，也不再追加新消息
+        PublishResult after = broker.publish("orders-dedup", 0, "k-dedup-new", "d-1", "v2");
+        assertEquals(PublishOutcome.DEDUPLICATED, after.outcome());
+        assertEquals(first.id(), after.message().id());
+        assertEquals(1L, after.message().offset());
+        assertEquals("v1", after.message().payload());
+        assertEquals(2L, broker.logEndOffset("orders-dedup", 0));
+        log.info("再发布 去重键=d-1 判定=幂等到重放消息 offset=1 payload=v1（非旧死信位点0）, logEnd 保持 2 不追加");
+
+        // 去重口径自洽：同一分区内同一去重键只对应一条有效消息（重放后的这条）
+        List<Message> tail = broker.poll("g-dedup", "orders-dedup", 0, 10);
+        assertTrue(tail.isEmpty(), "全部位点已确认，不应再有投递");
+        log.info("最终核对 去重键=d-1 判定=分区内仅 offset=1 一条有效消息, committed=2=logEnd 无残留投递");
     }
 
     @Test
